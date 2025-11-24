@@ -8,7 +8,8 @@ import {
   Scan, 
   Trash2, 
   Radio,
-  AlertTriangle
+  AlertTriangle,
+  RefreshCw
 } from 'lucide-react';
 
 // --- CONFIGURATION ---
@@ -33,6 +34,7 @@ export default function App() {
   });
 
   const [errors, setErrors] = useState([]);
+  const [usingLegacy, setUsingLegacy] = useState(false);
 
   // --- DATABASE STATE ---
   const [zones, setZones] = useState({
@@ -47,72 +49,115 @@ export default function App() {
   const [prediction, setPrediction] = useState(null); 
   const [motionState, setMotionState] = useState('STATIONARY');
 
-  // 1. INITIALIZE SENSORS (ROBUST)
+  // 1. INITIALIZE SENSORS (ROBUST WITH FALLBACK)
   useEffect(() => {
-    const startSensor = (SensorClass, name, updateKey) => {
-      if (!(name in window)) {
-        setErrors(prev => [...prev, `${name} not supported`]);
-        return;
-      }
-
-      try {
-        // PERMISSION CHECK (Optional but recommended)
-        navigator.permissions.query({ name: name.toLowerCase() })
-          .then(result => {
-            if (result.state === 'denied') {
-              setErrors(prev => [...prev, `${name}: Permission Denied`]);
-              return;
+    const initSensors = async () => {
+      // A. Try Modern Generic Sensor API First
+      if ('Magnetometer' in window && 'LinearAccelerationSensor' in window) {
+        try {
+            // PERMISSION CHECK
+            const perm = await navigator.permissions.query({ name: 'magnetometer' });
+            if (perm.state !== 'denied') {
+                startModernSensors();
+                return;
             }
-            
-            // INITIALIZE
-            // Note: We removed 'frequency' to let hardware use default safe speed
-            const sensor = new window[name]();
-            
-            sensor.addEventListener('error', (event) => {
-              if (event.error.name === 'NotReadableError') {
-                 // Hardware issue
-                 setErrors(prev => [...prev, `${name}: Hardware Locked`]);
-              } else if (event.error.name === 'SecurityError') {
-                 // HTTPS issue
-                 setErrors(prev => [...prev, `${name}: Needs HTTPS`]);
-              } else {
-                 setErrors(prev => [...prev, `${name}: ${event.error.name}`]);
-              }
-              console.log(`${name} error:`, event.error);
-            });
-
-            sensor.addEventListener('reading', () => {
-              // Calculate Magnitude
-              const val = Math.sqrt(sensor.x**2 + sensor.y**2 + sensor.z**2);
-              setSensors(prev => ({ ...prev, [updateKey]: val }));
-              setActiveSensors(prev => ({ ...prev, [updateKey]: true }));
-            });
-
-            sensor.start();
-          })
-          .catch(err => {
-             // Fallback: Just try to start it if permission query fails
-             console.log("Permission query failed, trying anyway...");
-             const sensor = new window[name]();
-             sensor.addEventListener('reading', () => {
-                const val = Math.sqrt(sensor.x**2 + sensor.y**2 + sensor.z**2);
-                setSensors(prev => ({ ...prev, [updateKey]: val }));
-                setActiveSensors(prev => ({ ...prev, [updateKey]: true }));
-             });
-             sensor.start();
-          });
-
-      } catch (err) {
-        setErrors(prev => [...prev, `${name} Init Failed: ${err.message}`]);
+        } catch (e) {
+            console.log("Permission query failed, trying legacy...");
+        }
       }
+
+      // B. Fallback to Legacy DeviceOrientation/Motion
+      setErrors(prev => [...prev, "Modern Sensors blocked. Attempting Legacy API..."]);
+      startLegacySensors();
     };
 
-    // Start All 3
-    startSensor('Magnetometer', 'Magnetometer', 'mag');
-    startSensor('LinearAccelerationSensor', 'LinearAccelerationSensor', 'accel');
-    startSensor('Gyroscope', 'Gyroscope', 'gyro');
-
+    initSensors();
   }, []);
+
+  const startModernSensors = () => {
+      const sensorConfig = { frequency: 60 };
+      
+      try {
+          const mag = new window.Magnetometer(sensorConfig);
+          mag.addEventListener('reading', () => {
+              const val = Math.sqrt(mag.x**2 + mag.y**2 + mag.z**2);
+              setSensors(prev => ({ ...prev, mag: val }));
+              setActiveSensors(prev => ({ ...prev, mag: true }));
+          });
+          mag.addEventListener('error', (e) => handleError('Mag', e));
+          mag.start();
+
+          const acc = new window.LinearAccelerationSensor(sensorConfig);
+          acc.addEventListener('reading', () => {
+              const val = Math.sqrt(acc.x**2 + acc.y**2 + acc.z**2);
+              setSensors(prev => ({ ...prev, accel: val }));
+              setActiveSensors(prev => ({ ...prev, accel: true }));
+          });
+          acc.start();
+
+          const gyr = new window.Gyroscope(sensorConfig);
+          gyr.addEventListener('reading', () => {
+              const val = Math.sqrt(gyr.x**2 + gyr.y**2 + gyr.z**2);
+              setSensors(prev => ({ ...prev, gyro: val }));
+              setActiveSensors(prev => ({ ...prev, gyro: true }));
+          });
+          gyr.start();
+
+      } catch (err) {
+          handleError('ModernInit', { error: err });
+          startLegacySensors(); // Failover
+      }
+  };
+
+  const startLegacySensors = () => {
+      setUsingLegacy(true);
+      
+      // 1. Motion (Accel + Gyro)
+      if ('DeviceMotionEvent' in window) {
+          window.addEventListener('devicemotion', (event) => {
+              // Accel (Linear)
+              if (event.acceleration) {
+                  const { x, y, z } = event.acceleration;
+                  const accVal = Math.sqrt((x||0)**2 + (y||0)**2 + (z||0)**2);
+                  setSensors(prev => ({ ...prev, accel: accVal }));
+                  setActiveSensors(prev => ({ ...prev, accel: true }));
+              }
+              // Gyro (Rotation Rate)
+              if (event.rotationRate) {
+                  const { alpha, beta, gamma } = event.rotationRate;
+                  // Roughly convert deg/s to rad/s for consistency
+                  const gyrVal = Math.sqrt((alpha||0)**2 + (beta||0)**2 + (gamma||0)**2) * (Math.PI / 180);
+                  setSensors(prev => ({ ...prev, gyro: gyrVal }));
+                  setActiveSensors(prev => ({ ...prev, gyro: true }));
+              }
+          });
+      } else {
+          setErrors(prev => [...prev, "Legacy DeviceMotion not supported"]);
+      }
+
+      // 2. Magnetometer (Compass Heading)
+      // Note: This gives Heading (0-360), not raw Field Strength (uT).
+      // But it is consistent per zone if you face the same way.
+      if ('DeviceOrientationEvent' in window) {
+          window.addEventListener('deviceorientation', (event) => {
+              // 'alpha' is compass heading (0-360)
+              // 'webkitCompassHeading' is for iOS
+              const magVal = event.webkitCompassHeading || event.alpha || 0;
+              
+              // We use this as a "Proxy" for magnetic signature. 
+              // It's not perfect strength, but orientation changes near magnets.
+              setSensors(prev => ({ ...prev, mag: magVal }));
+              setActiveSensors(prev => ({ ...prev, mag: true }));
+          }, true);
+      } else {
+          setErrors(prev => [...prev, "Legacy DeviceOrientation not supported"]);
+      }
+  };
+
+  const handleError = (name, event) => {
+      const msg = event.error ? event.error.message || event.error.name : "Unknown Error";
+      setErrors(prev => [...prev, `${name}: ${msg}`]);
+  };
 
 
   // 2. MOTION DETECTION ENGINE
@@ -166,31 +211,37 @@ export default function App() {
 
     Object.entries(zones).forEach(([id, zone]) => {
       if (!zone.data) return;
-      const magDiff = Math.abs(sensors.mag - zone.data.mag);
+      
+      // Special Logic for Legacy Compass (0-360 wraparound)
+      let magDiff = Math.abs(sensors.mag - zone.data.mag);
+      if (usingLegacy && magDiff > 180) magDiff = 360 - magDiff; // Shortest path
+
       const wifiDiff = Math.abs(sensors.wifi - zone.data.wifi);
-      const score = (magDiff * 2.0) + (wifiDiff * 1.0);
+      
+      // Weighting
+      const score = (magDiff * (usingLegacy ? 1.0 : 2.0)) + (wifiDiff * 1.0);
+      
       if (score < minDistance) {
         minDistance = score;
         bestZone = id;
       }
     });
 
-    if (bestZone && minDistance < 15) {
+    // Higher tolerance for Compass Heading vs Raw Mag Field
+    const tolerance = usingLegacy ? 40 : 15; 
+
+    if (bestZone && minDistance < tolerance) {
       setPrediction({ 
         id: bestZone, 
         name: zones[bestZone].name,
-        confidence: Math.max(0, 100 - (minDistance * 5)) 
+        confidence: Math.max(0, 100 - (minDistance * (usingLegacy ? 2 : 5))) 
       });
     } else {
       setPrediction(null);
     }
-  }, [sensors, mode, motionState, zones]);
+  }, [sensors, mode, motionState, zones, usingLegacy]);
 
-  // --- SIMULATION HANDLER ---
-  const handleSimChange = (key, val) => {
-    if (!activeSensors[key]) setSensors(prev => ({ ...prev, [key]: parseFloat(val) }));
-  };
-
+  // --- UI ---
   return (
     <div className="flex flex-col min-h-screen bg-gray-950 text-white font-sans max-w-md mx-auto border-x border-gray-800">
       
@@ -198,7 +249,7 @@ export default function App() {
       <div className="bg-gray-900 p-4 border-b border-gray-800 sticky top-0 z-50 shadow-md">
         <div className="flex justify-between items-center mb-4">
            <div className="flex items-center gap-2">
-             <Radio size={20} className={activeSensors.mag ? "text-green-500 animate-pulse" : "text-red-500"} />
+             <Radio size={20} className={(activeSensors.mag || activeSensors.accel) ? "text-green-500 animate-pulse" : "text-red-500"} />
              <span className="font-bold text-lg tracking-wider">WIPS <span className="text-blue-400">FUSION</span></span>
            </div>
            <div className={`px-2 py-1 rounded text-xs font-bold transition-colors ${motionState === 'MOVING' ? 'bg-orange-900 text-orange-200' : 'bg-green-900 text-green-200'}`}>
@@ -206,21 +257,23 @@ export default function App() {
            </div>
         </div>
 
-        {/* ERROR LOG (DEBUGGING) */}
-        {errors.length > 0 && (
-            <div className="mb-4 bg-red-900/50 p-2 rounded border border-red-800 text-[10px] font-mono text-red-200">
-                <div className="flex items-center gap-1 font-bold mb-1"><AlertTriangle size={12}/> SENSOR ERRORS:</div>
-                {errors.slice(-3).map((err, i) => <div key={i}>• {err}</div>)}
-                <div className="mt-1 text-gray-400">Check chrome://flags/#enable-generic-sensor-extra-classes</div>
-            </div>
-        )}
+        {/* ERROR / MODE LOG */}
+        <div className="mb-4 bg-gray-800 p-2 rounded border border-gray-700 text-[10px] font-mono text-gray-300">
+            {usingLegacy && <div className="text-yellow-400 font-bold mb-1 flex items-center gap-1"><RefreshCw size={10}/> USING LEGACY SENSORS (Compass Mode)</div>}
+            {errors.length > 0 && (
+                <div className="text-red-300">
+                    <div className="font-bold mb-1">ERRORS:</div>
+                    {errors.slice(-2).map((err, i) => <div key={i}>• {err}</div>)}
+                </div>
+            )}
+        </div>
 
         {/* SENSOR DASHBOARD */}
         <div className="grid grid-cols-4 gap-2 text-center mb-4">
           <div className={`p-2 rounded-lg ${activeSensors.mag ? 'bg-gray-800' : 'bg-gray-800/50 opacity-50'}`}>
             <Compass size={16} className="mx-auto mb-1 text-blue-400"/>
-            <div className="text-[10px] text-gray-400">MAG</div>
-            <div className="font-mono font-bold">{sensors.mag.toFixed(1)}</div>
+            <div className="text-[10px] text-gray-400">{usingLegacy ? "HEAD" : "MAG"}</div>
+            <div className="font-mono font-bold">{sensors.mag.toFixed(0)}</div>
           </div>
           <div className={`p-2 rounded-lg ${activeSensors.accel ? 'bg-gray-800' : 'bg-gray-800/50 opacity-50'}`}>
             <Move size={16} className="mx-auto mb-1 text-yellow-400"/>
@@ -253,29 +306,6 @@ export default function App() {
            />
            <div className="text-center text-[10px] text-green-500 mt-1 font-mono">* Manual WiFi Input</div>
         </div>
-        
-        {/* SIMULATOR CONTROLS (Only for missing sensors) */}
-        {(!activeSensors.mag || !activeSensors.gyro) && (
-             <div className="mt-4 pt-4 border-t border-gray-700">
-                 <div className="text-[10px] text-red-400 font-bold mb-2">SIMULATORS (For missing sensors)</div>
-                 {!activeSensors.mag && (
-                     <div className="mb-2">
-                        <div className="flex justify-between text-xs text-gray-500"><span>Mag Sim</span><span>{sensors.mag.toFixed(1)}</span></div>
-                        <input type="range" min="30" max="70" step="0.1" value={sensors.mag} onChange={(e) => handleSimChange('mag', e.target.value)} className="w-full h-1 bg-gray-700 rounded accent-blue-500"/>
-                     </div>
-                 )}
-                 {!activeSensors.gyro && (
-                    <button 
-                        className="w-full py-2 bg-gray-800 text-xs font-bold text-gray-300 hover:bg-gray-700 rounded border border-gray-600"
-                        onMouseDown={() => {handleSimChange('accel', 2.0); handleSimChange('gyro', 1.0);}}
-                        onMouseUp={() => {handleSimChange('accel', 0.0); handleSimChange('gyro', 0.0);}}
-                        onMouseLeave={() => {handleSimChange('accel', 0.0); handleSimChange('gyro', 0.0);}}
-                    >
-                        HOLD TO SIMULATE MOVEMENT
-                    </button>
-                 )}
-             </div>
-        )}
       </div>
 
       {/* TABS */}
@@ -290,7 +320,7 @@ export default function App() {
                  </div>
                  {zone.data ? (
                     <div className="grid grid-cols-2 gap-2 text-xs text-gray-400 bg-black/30 p-2 rounded">
-                        <div>Mag: {zone.data.mag.toFixed(1)}</div>
+                        <div>{usingLegacy ? "Head" : "Mag"}: {zone.data.mag.toFixed(0)}</div>
                         <div>WiFi: {zone.data.wifi.toFixed(0)}</div>
                     </div>
                  ) : (
@@ -307,6 +337,7 @@ export default function App() {
                  {motionState === 'MOVING' ? <Move size={48} className="text-orange-500 animate-bounce"/> : <Navigation size={48} className={prediction ? 'text-green-500' : 'text-gray-600'}/>}
              </div>
              <div className="text-2xl font-black">{prediction ? prediction.name : "SCANNING..."}</div>
+             {prediction && <div className="text-green-400 font-mono">CONFIDENCE: {prediction.confidence.toFixed(0)}%</div>}
           </div>
         )}
       </div>
